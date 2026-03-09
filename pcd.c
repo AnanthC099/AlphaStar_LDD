@@ -235,7 +235,7 @@ static struct file_operations lcd_fops = {
 	.read    = lcd_read_fop,
 };
 
-static char *lcd_devnode(const struct device *dev, umode_t *mode)
+static char *lcd_devnode(struct device *dev, umode_t *mode)
 {
 	if (mode)
 		*mode = 0666;

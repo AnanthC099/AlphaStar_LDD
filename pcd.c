@@ -1,14 +1,32 @@
+/*
+ * JHD162A 16x2 LCD Character Device Driver (HD44780, 4-bit mode)
+ *
+ * Pure char device driver — no platform/device-tree dependency.
+ *
+ * 4-bit mode wiring (Raspberry Pi 4):
+ *   RS  -> GPIO26 (Pin 37)
+ *   E   -> GPIO19 (Pin 35)
+ *   D4  -> GPIO13 (Pin 33)
+ *   D5  -> GPIO6  (Pin 31)
+ *   D6  -> GPIO5  (Pin 29)
+ *   D7  -> GPIO20 (Pin 38)
+ *   RW  -> GND    (Pin 9)   [write-only mode]
+ *
+ * Usage:
+ *   sudo insmod pcd.ko
+ *   echo "Hello World" > /dev/lcd_jhd162a
+ *   cat /dev/lcd_jhd162a
+ *   sudo rmmod pcd
+ */
+
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
-#include <linux/gpio/consumer.h>
+#include <linux/gpio.h>
 #include <linux/delay.h>
 #include <linux/string.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
 
 /* HD44780 commands */
 #define LCD_CMD_CLEAR		0x01
@@ -23,14 +41,24 @@
 #define LCD_ROWS		2
 #define LCD_BUF_SIZE		(LCD_COLS * LCD_ROWS)
 
+/* BCM GPIO numbers — match your wiring */
+#define GPIO_RS		26
+#define GPIO_EN		19
+#define GPIO_D4		13
+#define GPIO_D5		 6
+#define GPIO_D6		 5
+#define GPIO_D7		20
+
+#define DEVICE_NAME	"lcd_jhd162a"
+
 /* Per-device private data */
 struct lcd_dev {
-	struct gpio_desc *rs_gpio;
-	struct gpio_desc *en_gpio;
-	struct gpio_desc *d4_gpio;
-	struct gpio_desc *d5_gpio;
-	struct gpio_desc *d6_gpio;
-	struct gpio_desc *d7_gpio;
+	unsigned int rs_gpio;
+	unsigned int en_gpio;
+	unsigned int d4_gpio;
+	unsigned int d5_gpio;
+	unsigned int d6_gpio;
+	unsigned int d7_gpio;
 
 	dev_t devnum;
 	struct cdev cdev;
@@ -38,31 +66,30 @@ struct lcd_dev {
 	struct device *device;
 };
 
-/* There is only one LCD instance; store a reference for fops */
-static struct lcd_dev *lcd_instance;
+static struct lcd_dev lcd_instance;
 
 /* ============ Low-Level LCD Functions ============ */
 
 static void lcd_pulse_enable(struct lcd_dev *lcd)
 {
-	gpiod_set_value(lcd->en_gpio, 1);
+	gpio_set_value(lcd->en_gpio, 1);
 	udelay(1);		/* HD44780 needs E high >= 450ns */
-	gpiod_set_value(lcd->en_gpio, 0);
+	gpio_set_value(lcd->en_gpio, 0);
 	udelay(100);		/* Command execution time > 37us */
 }
 
 static void lcd_write_nibble(struct lcd_dev *lcd, uint8_t nibble)
 {
-	gpiod_set_value(lcd->d4_gpio, (nibble >> 0) & 1);
-	gpiod_set_value(lcd->d5_gpio, (nibble >> 1) & 1);
-	gpiod_set_value(lcd->d6_gpio, (nibble >> 2) & 1);
-	gpiod_set_value(lcd->d7_gpio, (nibble >> 3) & 1);
+	gpio_set_value(lcd->d4_gpio, (nibble >> 0) & 1);
+	gpio_set_value(lcd->d5_gpio, (nibble >> 1) & 1);
+	gpio_set_value(lcd->d6_gpio, (nibble >> 2) & 1);
+	gpio_set_value(lcd->d7_gpio, (nibble >> 3) & 1);
 	lcd_pulse_enable(lcd);
 }
 
 static void lcd_write_byte(struct lcd_dev *lcd, uint8_t val, int rs)
 {
-	gpiod_set_value(lcd->rs_gpio, rs);	/* 0=command, 1=data */
+	gpio_set_value(lcd->rs_gpio, rs);	/* 0=command, 1=data */
 	lcd_write_nibble(lcd, val >> 4);	/* High nibble first */
 	lcd_write_nibble(lcd, val & 0x0F);	/* Low nibble second */
 }
@@ -86,8 +113,8 @@ static void lcd_init_hw(struct lcd_dev *lcd)
 {
 	msleep(50);		/* Wait > 40ms after power-on */
 
-	gpiod_set_value(lcd->rs_gpio, 0);
-	gpiod_set_value(lcd->en_gpio, 0);
+	gpio_set_value(lcd->rs_gpio, 0);
+	gpio_set_value(lcd->en_gpio, 0);
 
 	/* Special init sequence: 0x03 three times, then 0x02 for 4-bit */
 	lcd_write_nibble(lcd, 0x03);
@@ -128,7 +155,7 @@ static void lcd_print_line(struct lcd_dev *lcd, const char *text, int row)
 
 static int lcd_open(struct inode *inode, struct file *filp)
 {
-	filp->private_data = lcd_instance;
+	filp->private_data = &lcd_instance;
 	pr_info("lcd: device opened\n");
 	return 0;
 }
@@ -208,102 +235,122 @@ static struct file_operations lcd_fops = {
 	.read    = lcd_read_fop,
 };
 
-static char *lcd_devnode(struct device *dev, umode_t *mode)
+static char *lcd_devnode(const struct device *dev, umode_t *mode)
 {
 	if (mode)
 		*mode = 0666;
 	return NULL;
 }
 
-/* ============ Platform Driver Probe / Remove ============ */
+/* ============ GPIO Request / Free Helpers ============ */
 
-static int lcd_probe(struct platform_device *pdev)
+struct gpio_pin {
+	unsigned int gpio;
+	const char *label;
+};
+
+static const struct gpio_pin lcd_gpios[] = {
+	{ GPIO_RS, "lcd_rs" },
+	{ GPIO_EN, "lcd_en" },
+	{ GPIO_D4, "lcd_d4" },
+	{ GPIO_D5, "lcd_d5" },
+	{ GPIO_D6, "lcd_d6" },
+	{ GPIO_D7, "lcd_d7" },
+};
+
+#define NUM_LCD_GPIOS	ARRAY_SIZE(lcd_gpios)
+
+static void lcd_free_gpios(int count)
 {
-	struct lcd_dev *lcd;
+	int i;
+
+	for (i = 0; i < count; i++)
+		gpio_free(lcd_gpios[i].gpio);
+}
+
+static int lcd_request_gpios(void)
+{
+	int i, ret;
+
+	for (i = 0; i < NUM_LCD_GPIOS; i++) {
+		ret = gpio_request(lcd_gpios[i].gpio, lcd_gpios[i].label);
+		if (ret) {
+			pr_err("lcd: failed to request GPIO%u (%s): %d\n",
+			       lcd_gpios[i].gpio, lcd_gpios[i].label, ret);
+			lcd_free_gpios(i);
+			return ret;
+		}
+
+		ret = gpio_direction_output(lcd_gpios[i].gpio, 0);
+		if (ret) {
+			pr_err("lcd: failed to set GPIO%u as output: %d\n",
+			       lcd_gpios[i].gpio, ret);
+			lcd_free_gpios(i + 1);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/* ============ Module Init / Exit ============ */
+
+static int __init lcd_init(void)
+{
+	struct lcd_dev *lcd = &lcd_instance;
 	int ret;
 
-	lcd = devm_kzalloc(&pdev->dev, sizeof(*lcd), GFP_KERNEL);
-	if (!lcd)
-		return -ENOMEM;
+	/* Request and configure GPIO pins */
+	ret = lcd_request_gpios();
+	if (ret)
+		return ret;
 
-	/* Acquire GPIO descriptors from the device tree */
-	lcd->rs_gpio = devm_gpiod_get(&pdev->dev, "rs", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->rs_gpio)) {
-		dev_err(&pdev->dev, "failed to get RS gpio\n");
-		return PTR_ERR(lcd->rs_gpio);
-	}
-
-	lcd->en_gpio = devm_gpiod_get(&pdev->dev, "enable", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->en_gpio)) {
-		dev_err(&pdev->dev, "failed to get Enable gpio\n");
-		return PTR_ERR(lcd->en_gpio);
-	}
-
-	lcd->d4_gpio = devm_gpiod_get(&pdev->dev, "d4", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->d4_gpio)) {
-		dev_err(&pdev->dev, "failed to get D4 gpio\n");
-		return PTR_ERR(lcd->d4_gpio);
-	}
-
-	lcd->d5_gpio = devm_gpiod_get(&pdev->dev, "d5", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->d5_gpio)) {
-		dev_err(&pdev->dev, "failed to get D5 gpio\n");
-		return PTR_ERR(lcd->d5_gpio);
-	}
-
-	lcd->d6_gpio = devm_gpiod_get(&pdev->dev, "d6", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->d6_gpio)) {
-		dev_err(&pdev->dev, "failed to get D6 gpio\n");
-		return PTR_ERR(lcd->d6_gpio);
-	}
-
-	lcd->d7_gpio = devm_gpiod_get(&pdev->dev, "d7", GPIOD_OUT_LOW);
-	if (IS_ERR(lcd->d7_gpio)) {
-		dev_err(&pdev->dev, "failed to get D7 gpio\n");
-		return PTR_ERR(lcd->d7_gpio);
-	}
+	lcd->rs_gpio = GPIO_RS;
+	lcd->en_gpio = GPIO_EN;
+	lcd->d4_gpio = GPIO_D4;
+	lcd->d5_gpio = GPIO_D5;
+	lcd->d6_gpio = GPIO_D6;
+	lcd->d7_gpio = GPIO_D7;
 
 	/* Initialize the LCD hardware and display "AlphaStar" */
 	lcd_init_hw(lcd);
 	lcd_print_line(lcd, "AlphaStar", 0);
-	dev_info(&pdev->dev, "displayed 'AlphaStar' on JHD162A\n");
+	pr_info("lcd: displayed 'AlphaStar' on JHD162A\n");
 
-	/* Register character device */
-	ret = alloc_chrdev_region(&lcd->devnum, 0, 1, "lcd_jhd162a");
+	/* Allocate character device region */
+	ret = alloc_chrdev_region(&lcd->devnum, 0, 1, DEVICE_NAME);
 	if (ret) {
-		dev_err(&pdev->dev, "alloc_chrdev_region failed: %d\n", ret);
-		return ret;
+		pr_err("lcd: alloc_chrdev_region failed: %d\n", ret);
+		goto err_gpio;
 	}
 
+	/* Initialize and add cdev */
 	cdev_init(&lcd->cdev, &lcd_fops);
 	lcd->cdev.owner = THIS_MODULE;
 	ret = cdev_add(&lcd->cdev, lcd->devnum, 1);
 	if (ret) {
-		dev_err(&pdev->dev, "cdev_add failed: %d\n", ret);
+		pr_err("lcd: cdev_add failed: %d\n", ret);
 		goto err_unreg;
 	}
 
-	lcd->class = class_create(THIS_MODULE, "lcd_class");
+	/* Create device class and device node */
+	lcd->class = class_create(DEVICE_NAME);
 	if (IS_ERR(lcd->class)) {
 		ret = PTR_ERR(lcd->class);
-		dev_err(&pdev->dev, "class_create failed: %d\n", ret);
+		pr_err("lcd: class_create failed: %d\n", ret);
 		goto err_cdev;
 	}
 	lcd->class->devnode = lcd_devnode;
 
-	lcd->device = device_create(lcd->class, &pdev->dev, lcd->devnum,
-				    NULL, "lcd_jhd162a");
+	lcd->device = device_create(lcd->class, NULL, lcd->devnum,
+				    NULL, DEVICE_NAME);
 	if (IS_ERR(lcd->device)) {
 		ret = PTR_ERR(lcd->device);
-		dev_err(&pdev->dev, "device_create failed: %d\n", ret);
+		pr_err("lcd: device_create failed: %d\n", ret);
 		goto err_class;
 	}
 
-	/* Store for fops access and platform driver data */
-	lcd_instance = lcd;
-	platform_set_drvdata(pdev, lcd);
-
-	dev_info(&pdev->dev, "JHD162A LCD driver probed (/dev/lcd_jhd162a)\n");
+	pr_info("lcd: JHD162A char driver loaded (/dev/%s)\n", DEVICE_NAME);
 	return 0;
 
 err_class:
@@ -312,12 +359,14 @@ err_cdev:
 	cdev_del(&lcd->cdev);
 err_unreg:
 	unregister_chrdev_region(lcd->devnum, 1);
+err_gpio:
+	lcd_free_gpios(NUM_LCD_GPIOS);
 	return ret;
 }
 
-static int lcd_remove(struct platform_device *pdev)
+static void __exit lcd_exit(void)
 {
-	struct lcd_dev *lcd = platform_get_drvdata(pdev);
+	struct lcd_dev *lcd = &lcd_instance;
 
 	/* Clear the LCD before removing */
 	lcd_send_command(lcd, LCD_CMD_CLEAR);
@@ -326,32 +375,14 @@ static int lcd_remove(struct platform_device *pdev)
 	class_destroy(lcd->class);
 	cdev_del(&lcd->cdev);
 	unregister_chrdev_region(lcd->devnum, 1);
+	lcd_free_gpios(NUM_LCD_GPIOS);
 
-	lcd_instance = NULL;
-
-	dev_info(&pdev->dev, "JHD162A LCD driver removed\n");
-	return 0;
+	pr_info("lcd: JHD162A char driver removed\n");
 }
 
-/* Device Tree match table — must match "compatible" in the overlay */
-static const struct of_device_id lcd_of_match[] = {
-	{ .compatible = "alphastar,lcd-jhd162a" },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, lcd_of_match);
-
-static struct platform_driver lcd_platform_driver = {
-	.probe  = lcd_probe,
-	.remove = lcd_remove,
-	.driver = {
-		.name           = "lcd_jhd162a",
-		.of_match_table = lcd_of_match,
-		.owner          = THIS_MODULE,
-	},
-};
-
-module_platform_driver(lcd_platform_driver);
+module_init(lcd_init);
+module_exit(lcd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("alphastar");
-MODULE_DESCRIPTION("JHD162A 16x2 LCD platform driver for Raspberry Pi 4");
+MODULE_DESCRIPTION("JHD162A 16x2 LCD char device driver for Raspberry Pi 4");

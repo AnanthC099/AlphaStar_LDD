@@ -1,0 +1,52 @@
+/*
+ * Device Tree Overlay for JHD162A 16x2 LCD (HD44780) on Raspberry Pi 4
+ *
+ * 4-bit mode wiring:
+ *   RS  -> GPIO26 (Pin 37)
+ *   E   -> GPIO19 (Pin 35)
+ *   D4  -> GPIO13 (Pin 33)
+ *   D5  -> GPIO6  (Pin 31)
+ *   D6  -> GPIO5  (Pin 29)
+ *   D7  -> GPIO20 (Pin 38)
+ *   RW  -> GND    (Pin 9)   [write-only mode]
+ *
+ * Usage:
+ *   1. Compile:  dtc -@ -I dts -O dtb -o lcd_jhd162a.dtbo lcd_jhd162a_overlay.dts
+ *   2. Copy:     sudo cp lcd_jhd162a.dtbo /boot/overlays/
+ *   3. Enable:   Add "dtoverlay=lcd_jhd162a" to /boot/config.txt
+ *   4. Reboot:   sudo reboot
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+			lcd_jhd162a: lcd_jhd162a {
+				compatible = "alphastar,lcd-jhd162a";
+				status = "okay";
+
+				/*
+				 * GPIO pins defined using the BCM2711 GPIO controller.
+				 * Each entry: <&gpio pin_number active_level>
+				 * GPIO_ACTIVE_HIGH = 0
+				 *
+				 * Order: rs, enable, d4, d5, d6, d7
+				 */
+				rs-gpios     = <&gpio 26 0>;  /* GPIO26 - Register Select */
+				enable-gpios = <&gpio 19 0>;  /* GPIO19 - Enable          */
+				d4-gpios     = <&gpio 13 0>;  /* GPIO13 - Data bit 4      */
+				d5-gpios     = <&gpio  6 0>;  /* GPIO6  - Data bit 5      */
+				d6-gpios     = <&gpio  5 0>;  /* GPIO5  - Data bit 6      */
+				d7-gpios     = <&gpio 20 0>;  /* GPIO20 - Data bit 7      */
+
+				display-rows    = <2>;
+				display-columns = <16>;
+			};
+		};
+	};
+};
